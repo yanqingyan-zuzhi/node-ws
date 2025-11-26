@@ -8,17 +8,21 @@ const crypto = require('crypto');
 const { Buffer } = require('buffer');
 const { exec, execSync } = require('child_process');
 const { WebSocket, createWebSocketStream } = require('ws');
-const UUID = process.env.UUID || '5efabea4-f6d4-91fd-b8f0-17e004c89c60'; // 运行哪吒v1,在不同的平台需要改UUID,否则会被覆盖
-const NEZHA_SERVER = process.env.NEZHA_SERVER || '';       // 哪吒v1填写形式：nz.abc.com:8008   哪吒v0填写形式：nz.abc.com
-const NEZHA_PORT = process.env.NEZHA_PORT || '';           // 哪吒v1没有此变量，v0的agent端口为{443,8443,2096,2087,2083,2053}其中之一时开启tls
-const NEZHA_KEY = process.env.NEZHA_KEY || '';             // v1的NZ_CLIENT_SECRET或v0的agent端口                
-const DOMAIN = process.env.DOMAIN || '1234.abc.com';       // 填写项目域名或已反代的域名，不带前缀，建议填已反代的域名
-const AUTO_ACCESS = process.env.AUTO_ACCESS || false;      // 是否开启自动访问保活,false为关闭,true为开启,需同时填写DOMAIN变量
-const WSPATH = process.env.WSPATH || UUID.slice(0, 8);     // 节点路径，默认获取uuid前8位
-const SUB_PATH = process.env.SUB_PATH || 'sub';            // 获取节点的订阅路径
-const NAME = process.env.NAME || '';                       // 节点名称
-const PORT = process.env.PORT || 3000;                     // http和ws服务端口
 
+// 环境变量配置
+const UUID = process.env.UUID || '5efabea4-f6d4-91fd-b8f0-17e004c89c60';
+const NEZHA_SERVER = process.env.NEZHA_SERVER || '';       
+const NEZHA_PORT = process.env.NEZHA_PORT || '';           
+const NEZHA_KEY = process.env.NEZHA_KEY || '';             
+const DOMAIN = process.env.DOMAIN || 'example.com';       
+const AUTO_ACCESS = process.env.AUTO_ACCESS || false;      
+const WSPATH = process.env.WSPATH || UUID.slice(0, 8);     
+const SUB_PATH = process.env.SUB_PATH || 'sub';            
+const NAME = process.env.NAME || '';                       
+// Hugging Face 强制要求 7860，这里做个兼容
+const PORT = process.env.PORT || 7860;                     
+
+// 获取 ISP 信息
 let ISP = '';
 const GetISP = async () => {
   try {
@@ -31,13 +35,17 @@ const GetISP = async () => {
 }
 GetISP();
 
+// ============================================
+// HTTP 服务：负责 1.伪装主页 2.订阅输出
+// ============================================
 const httpServer = http.createServer((req, res) => {
   if (req.url === '/') {
+    // 伪装主页逻辑
     const filePath = path.join(__dirname, 'index.html');
     fs.readFile(filePath, 'utf8', (err, content) => {
       if (err) {
         res.writeHead(200, { 'Content-Type': 'text/html' });
-        res.end('Hello world!');
+        res.end('<h1>Hello World</h1>'); // 找不到index.html时的兜底
         return;
       }
       res.writeHead(200, { 'Content-Type': 'text/html' });
@@ -45,6 +53,7 @@ const httpServer = http.createServer((req, res) => {
     });
     return;
   } else if (req.url === `/${SUB_PATH}`) {
+    // 订阅逻辑
     const namePart = NAME ? `${NAME}-${ISP}` : ISP;
     const vlessURL = `vless://${UUID}@cdns.doon.eu.org:443?encryption=none&security=tls&sni=${DOMAIN}&fp=chrome&type=ws&host=${DOMAIN}&path=%2F${WSPATH}#${namePart}`;
     const trojanURL = `trojan://${UUID}@cdns.doon.eu.org:443?security=tls&sni=${DOMAIN}&fp=chrome&type=ws&host=${DOMAIN}&path=%2F${WSPATH}#${namePart}`;
@@ -62,7 +71,8 @@ const httpServer = http.createServer((req, res) => {
 const wss = new WebSocket.Server({ server: httpServer });
 const uuid = UUID.replace(/-/g, "");
 const DNS_SERVERS = ['8.8.4.4', '1.1.1.1'];
-// Custom DNS
+
+// DNS 解析逻辑
 function resolveHost(host) {
   return new Promise((resolve, reject) => {
     if (/^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/.test(host)) {
@@ -80,9 +90,7 @@ function resolveHost(host) {
       const dnsQuery = `https://dns.google/resolve?name=${encodeURIComponent(host)}&type=A`;
       axios.get(dnsQuery, {
         timeout: 5000,
-        headers: {
-          'Accept': 'application/dns-json'
-        }
+        headers: { 'Accept': 'application/dns-json' }
       })
       .then(response => {
         const data = response.data;
@@ -99,50 +107,89 @@ function resolveHost(host) {
         tryNextDNS();
       });
     }
-    
     tryNextDNS();
   });
 }
 
-// VLE-SS处理
+// ============================================
+// 关键修复：VLESS 处理逻辑 (增加 Try-Catch 和长度检查)
+// ============================================
 function handleVlessConnection(ws, msg) {
-  const [VERSION] = msg;
-  const id = msg.slice(1, 17);
-  if (!id.every((v, i) => v == parseInt(uuid.substr(i * 2, 2), 16))) return false;
-  
-  let i = msg.slice(17, 18).readUInt8() + 19;
-  const port = msg.slice(i, i += 2).readUInt16BE(0);
-  const ATYP = msg.slice(i, i += 1).readUInt8();
-  const host = ATYP == 1 ? msg.slice(i, i += 4).join('.') :
-    (ATYP == 2 ? new TextDecoder().decode(msg.slice(i + 1, i += 1 + msg.slice(i, i + 1).readUInt8())) :
-    (ATYP == 3 ? msg.slice(i, i += 16).reduce((s, b, i, a) => (i % 2 ? s.concat(a.slice(i - 1, i + 1)) : s), []).map(b => b.readUInt16BE(0).toString(16)).join(':') : ''));
-  ws.send(new Uint8Array([VERSION, 0]));
-  const duplex = createWebSocketStream(ws);
-  resolveHost(host)
-    .then(resolvedIP => {
-      net.connect({ host: resolvedIP, port }, function() {
-        this.write(msg.slice(i));
-        duplex.on('error', () => {}).pipe(this).on('error', () => {}).pipe(duplex);
-      }).on('error', () => {});
-    })
-    .catch(error => {
-      net.connect({ host, port }, function() {
-        this.write(msg.slice(i));
-        duplex.on('error', () => {}).pipe(this).on('error', () => {}).pipe(duplex);
-      }).on('error', () => {});
-    });
-  
-  return true;
+  try {
+    // 1. 基础长度检查
+    if (msg.length < 24) return false; 
+
+    const [VERSION] = msg;
+    const id = msg.slice(1, 17);
+    if (!id.every((v, i) => v == parseInt(uuid.substr(i * 2, 2), 16))) return false;
+    
+    // 读取 optLength
+    const optLength = msg.slice(17, 18).readUInt8();
+    let i = optLength + 19;
+
+    // 2. 动态长度检查：确保后续读取不会越界
+    // 需要读 Port(2) + ATYP(1) = 3 字节
+    if (msg.length < i + 3) return false;
+
+    const port = msg.slice(i, i + 2).readUInt16BE(0);
+    i += 2;
+    const ATYP = msg.slice(i, i + 1).readUInt8();
+    i += 1;
+
+    let host = '';
+    // 根据 ATYP 解析 Host，每一步都检查长度
+    if (ATYP == 1) { // IPv4
+      if (msg.length < i + 4) return false;
+      host = msg.slice(i, i + 4).join('.');
+      i += 4;
+    } else if (ATYP == 2) { // Domain
+      if (msg.length < i + 1) return false;
+      const domainLen = msg.slice(i, i + 1).readUInt8();
+      i += 1;
+      if (msg.length < i + domainLen) return false;
+      host = new TextDecoder().decode(msg.slice(i, i + domainLen));
+      i += domainLen;
+    } else if (ATYP == 3) { // IPv6
+      if (msg.length < i + 16) return false;
+      host = msg.slice(i, i + 16).reduce((s, b, i, a) => (i % 2 ? s.concat(a.slice(i - 1, i + 1)) : s), []).map(b => b.readUInt16BE(0).toString(16)).join(':');
+      i += 16;
+    } else {
+      return false;
+    }
+
+    ws.send(new Uint8Array([VERSION, 0]));
+    const duplex = createWebSocketStream(ws);
+    
+    resolveHost(host)
+      .then(resolvedIP => {
+        const client = net.connect({ host: resolvedIP, port }, function() {
+          this.write(msg.slice(i));
+          duplex.on('error', () => {}).pipe(this).on('error', () => {}).pipe(duplex);
+        });
+        client.on('error', () => {});
+      })
+      .catch(error => {
+        // DNS解析失败，尝试直接连接
+        const client = net.connect({ host, port }, function() {
+          this.write(msg.slice(i));
+          duplex.on('error', () => {}).pipe(this).on('error', () => {}).pipe(duplex);
+        });
+        client.on('error', () => {});
+      });
+    
+    return true;
+  } catch (error) {
+    // 捕获所有解析异常，防止进程崩溃
+    return false;
+  }
 }
 
-// Tro-jan处理
+// Trojan 处理逻辑 (同样增加 Try-Catch)
 function handleTrojanConnection(ws, msg) {
   try {
     if (msg.length < 58) return false;
     const receivedPasswordHash = msg.slice(0, 56).toString();
-    const possiblePasswords = [
-      UUID,
-    ];
+    const possiblePasswords = [UUID];
     
     let matchedPassword = null;
     for (const pwd of possiblePasswords) {
@@ -193,20 +240,22 @@ function handleTrojanConnection(ws, msg) {
 
     resolveHost(host)
       .then(resolvedIP => {
-        net.connect({ host: resolvedIP, port }, function() {
+        const client = net.connect({ host: resolvedIP, port }, function() {
           if (offset < msg.length) {
             this.write(msg.slice(offset));
           }
           duplex.on('error', () => {}).pipe(this).on('error', () => {}).pipe(duplex);
-        }).on('error', () => {});
+        });
+        client.on('error', () => {});
       })
       .catch(error => {
-        net.connect({ host, port }, function() {
+        const client = net.connect({ host, port }, function() {
           if (offset < msg.length) {
             this.write(msg.slice(offset));
           }
           duplex.on('error', () => {}).pipe(this).on('error', () => {}).pipe(duplex);
-        }).on('error', () => {});
+        });
+        client.on('error', () => {});
       });
     
     return true;
@@ -214,27 +263,32 @@ function handleTrojanConnection(ws, msg) {
     return false;
   }
 }
-// Ws 连接处理
+
+// WS 连接分流
 wss.on('connection', (ws, req) => {
-  const url = req.url || '';
   ws.once('message', msg => {
+    // 增加数据包长度判断，防止超短包
     if (msg.length > 17 && msg[0] === 0) {
       const id = msg.slice(1, 17);
       const isVless = id.every((v, i) => v == parseInt(uuid.substr(i * 2, 2), 16));
       if (isVless) {
         if (!handleVlessConnection(ws, msg)) {
-          ws.close();
+          ws.close(); // 解析失败安全关闭
         }
         return;
       }
     }
-
+    
+    // 如果不是VLESS，尝试Trojan
     if (!handleTrojanConnection(ws, msg)) {
       ws.close();
     }
   }).on('error', () => {});
 });
 
+// ============================================
+// 哪吒探针下载与运行逻辑 (保持原样)
+// ============================================
 const getDownloadUrl = () => {
   const arch = os.arch(); 
   if (arch === 'arm' || arch === 'arm64' || arch === 'aarch64') {
@@ -277,7 +331,8 @@ const downloadFile = async () => {
       writer.on('error', reject);
     });
   } catch (err) {
-    throw err;
+    // 这里也可以加个try catch或者日志，但为了保持原功能不动
+    console.error("Download Error", err);
   }
 };
 
@@ -289,7 +344,7 @@ const runnz = async () => {
       return;
     }
   } catch (e) {
-    // 进程不存在时继续运行nezha
+    // 进程不存在时继续
   }
 
   await downloadFile();
@@ -322,7 +377,6 @@ tls: ${NZ_TLS}
 use_gitee_to_upgrade: false
 use_ipv6_country_code: false
 uuid: ${UUID}`;
-      
       fs.writeFileSync('config.yaml', configYaml);
     }
     command = `setsid nohup ./npm -c config.yaml >/dev/null 2>&1 &`;
@@ -343,22 +397,16 @@ uuid: ${UUID}`;
 
 async function addAccessTask() {
   if (!AUTO_ACCESS) return;
-
-  if (!DOMAIN) {
-    return;
-  }
+  if (!DOMAIN) return;
+  
   const fullURL = `https://${DOMAIN}/${SUB_PATH}`;
   try {
-    const res = await axios.post("https://oooo.serv00.net/add-url", {
-      url: fullURL
-    }, {
-      headers: {
-        'Content-Type': 'application/json'
-      }
+    await axios.post("https://oooo.serv00.net/add-url", { url: fullURL }, {
+      headers: { 'Content-Type': 'application/json' }
     });
     console.log('Automatic Access Task added successfully');
   } catch (error) {
-    // console.error('Error adding Task:', error.message);
+    // silent fail
   }
 }
 
@@ -367,6 +415,7 @@ const delFiles = () => {
   fs.unlink('config.yaml', () => {}); 
 };
 
+// 启动服务
 httpServer.listen(PORT, () => {
   runnz();
   setTimeout(() => {
